@@ -827,12 +827,12 @@ export function runCasesBuffer(casesBuf) {
   const r1 = 'a,b,c\n';
   const r2 = '"q1,q2""q3\r\n\n/\t\r",plain/x\t,"q"junk,x\ry\r\n';
   const r3 = '"q1","qnl"\n"q2","qcrlf"\r\n\n1\n1,2,3,4,5\n';
-  const body = (r1 + r2 + r3).repeat(12);
+  const body = (r1 + r2 + r3);
   const wb = Buffer.from(JSON.stringify([
     { id: 'w1', input: { text: '\uFEFF' + body + '"unterm\r\n', header: true } },
     { id: 'w2', input: { text: body + '"end"junk', header: false } },
     { id: 'w3', input: { text: 'h1,h2\n"qend"', header: true } },
     { id: 'w4', input: { text: '', header: true } },
   ]).replaceAll('/', '\\/'));
-  for (let i = 0; i < 6; i++) runCasesBuffer(wb);
+  for (let i = 0; i < 3; i++) runCasesBuffer(wb);
 }
