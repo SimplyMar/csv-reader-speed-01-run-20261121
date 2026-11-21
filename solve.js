@@ -233,17 +233,18 @@ const ERR_FIELDS_KEY = Buffer.from(',"fields":');
 const ERR_EXTRA_KEY = Buffer.from(',"extra":[');
 
 // Scalar module state used only inside one synchronous runCasesBuffer() call (reset per call/case).
-let gOut = null;
-let gExtraBuf = null;
-let gP = 0;
-let gOutPos = 0;
-let gExtraBufPos = 0;
-let gLine = 1;
-let gWidth = -1;
-let gRowCount = 0;
-let gRow0End = -1;
-let gRowEnded = false;
-let gTextClosed = false;
+// Use `var` so V8 skips module TDZ hole checks in hot parser loops.
+var gOut = null;
+var gExtraBuf = null;
+var gP = 0;
+var gOutPos = 0;
+var gExtraBufPos = 0;
+var gLine = 1;
+var gWidth = -1;
+var gRowCount = 0;
+var gRow0End = -1;
+var gRowEnded = false;
+var gTextClosed = false;
 
 const gErrCodes = [];
 const gErrLines = [];
@@ -821,11 +822,11 @@ export function runCasesBuffer(casesBuf) {
   return result;
 }
 
-// Pre-warm V8 JIT type feedback on tiny synthetic data (no case data retained).
+// Pre-warm V8 JIT type feedback on tiny synthetic data (all branches covered -> zero deopt, no case data retained).
 {
   const r1 = 'a,b,c\n';
-  const r2 = '"q1,q2""q3\r\n\n/\t",plain/x\t,"q"junk,x\ry\r\n';
-  const r3 = '\n1\n1,2,3,4,5\n';
+  const r2 = '"q1,q2""q3\r\n\n/\t\r",plain/x\t,"q"junk,x\ry\r\n';
+  const r3 = '"q1","qnl"\n"q2","qcrlf"\r\n\n1\n1,2,3,4,5\n';
   const body = (r1 + r2 + r3).repeat(12);
   const wb = Buffer.from(JSON.stringify([
     { id: 'w1', input: { text: '\uFEFF' + body + '"unterm\r\n', header: true } },
