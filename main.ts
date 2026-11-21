@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { setFlagsFromString } from 'node:v8';
 
-setFlagsFromString('--no-incremental-marking --maglev --no-turbofan --no-concurrent-recompilation');
+setFlagsFromString('--no-incremental-marking --no-concurrent-recompilation');
 
 const { runCasesBuffer } = await import('./solve.js');
 
