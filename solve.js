@@ -210,7 +210,7 @@ export function run(input) {
 }
 
 // ============================================================================
-// Compact single-pass UTF-8 JSON-to-JSON byte engine
+// Split-row single-pass UTF-8 JSON-to-JSON byte engine
 // ============================================================================
 
 const B_PREFIX_HDR_TRUE = Buffer.from('{"columns":');
@@ -219,12 +219,6 @@ const B_PREFIX_HDR_FALSE = Buffer.from('{"columns":null,"rows":[');
 const B_EMPTY_HDR_TRUE = Buffer.from('{"columns":[],"rows":[],"errors":[');
 const B_ERR_MID = Buffer.from('],"errors":[');
 const B_END_OBJ = Buffer.from(']}');
-
-const ERR_CODE_STRAY_CR = 0;
-const ERR_CODE_UNTERM = 1;
-const ERR_CODE_QUOTE_JUNK = 2;
-const ERR_CODE_SHORT = 3;
-const ERR_CODE_LONG = 4;
 
 const ERR_PREFIXES = [
   Buffer.from('{"code":"stray_cr","line":'),
@@ -237,6 +231,52 @@ const ERR_ROW_KEY = Buffer.from(',"row":');
 const ERR_NULL = Buffer.from('null');
 const ERR_FIELDS_KEY = Buffer.from(',"fields":');
 const ERR_EXTRA_KEY = Buffer.from(',"extra":[');
+
+// Scalar module state used only inside one synchronous runCasesBuffer() call (reset per call/case).
+let gOut = null;
+let gExtraBuf = null;
+let gP = 0;
+let gOutPos = 0;
+let gExtraBufPos = 0;
+let gLine = 1;
+let gWidth = -1;
+let gRowCount = 0;
+let gRow0End = -1;
+let gRowEnded = false;
+let gTextClosed = false;
+
+const gErrCodes = [];
+const gErrLines = [];
+const gErrRows = [];
+const gErrExtraA = [];
+const gErrExtraB = [];
+
+function ensureOut(need) {
+  if (gOutPos + need <= gOut.length) return gOut;
+  const nb = Buffer.allocUnsafe(Math.max(gOut.length * 2, gOutPos + need + 65536));
+  const next = new Uint8Array(nb.buffer, nb.byteOffset, nb.byteLength);
+  next.set(gOut.subarray(0, gOutPos));
+  gOut = next;
+  return next;
+}
+
+function growExtra(need) {
+  const nb = Buffer.allocUnsafe(Math.max(gExtraBuf.length * 2, need + 4096));
+  const next = new Uint8Array(nb.buffer, nb.byteOffset, nb.byteLength);
+  next.set(gExtraBuf.subarray(0, gExtraBufPos));
+  gExtraBuf = next;
+  return next;
+}
+
+function writeAsciiInt(out, pos, n) {
+  if (n === 0) { out[pos++] = 0x30; return pos; }
+  let tmp = n;
+  let digits = 0;
+  while (tmp > 0) { digits++; tmp = (tmp / 10) | 0; }
+  let idx = pos + digits - 1;
+  while (n > 0) { out[idx--] = 0x30 + (n % 10); n = (n / 10) | 0; }
+  return pos + digits;
+}
 
 function skipWs(buf, p, end) {
   while (p < end) {
@@ -291,56 +331,12 @@ function skipJsonValue(buf, p, end) {
   return p;
 }
 
-function writeAsciiInt(target, pos, n) {
-  if (n === 0) {
-    target[pos++] = 0x30;
-    return pos;
-  }
-  let tmp = n;
-  let digits = 0;
-  while (tmp > 0) {
-    digits++;
-    tmp = (tmp / 10) | 0;
-  }
-  let idx = pos + digits - 1;
-  while (n > 0) {
-    target[idx--] = 0x30 + (n % 10);
-    n = (n / 10) | 0;
-  }
-  return pos + digits;
-}
-
-function ensureOutBuf(outState, need) {
-  const out = outState.buf;
-  if (outState.pos + need > out.length) {
-    const next = Buffer.allocUnsafe(Math.max(out.length * 2, outState.pos + need + 65536));
-    out.copy(next, 0, 0, outState.pos);
-    outState.buf = next;
-  }
-  return outState.buf;
-}
-
-/** Cold helper: reads unquoted tail after an unterminated quote or closing quote (for quote_junk / stray_cr). */
-function readTailIntoOut(buf, len, outState, recordLine, recordRowIdx, isUnterminated) {
-  let p = outState.p;
-  let outPos = outState.pos;
-  let out = outState.buf;
-  let safeLimit = out.length - 8192;
-  let line = outState.line;
+function handleTail(buf, p, len, out, outPos, recordLine, recordRowIdx, isUnterm) {
   let added = 0;
+  let line = gLine;
   let rowEnded = false;
   let textClosed = false;
-  let nextChk = p + 4096;
-
   while (p < len) {
-    if (p >= nextChk) {
-      if (outPos >= safeLimit) {
-        outState.pos = outPos;
-        out = ensureOutBuf(outState, 65536);
-        safeLimit = out.length - 8192;
-      }
-      nextChk = p + 4096;
-    }
     const b = buf[p];
     if (b === 0x2c) { p++; break; }
     if (b === 0x22) { textClosed = true; rowEnded = true; break; }
@@ -349,14 +345,8 @@ function readTailIntoOut(buf, len, outState, recordLine, recordRowIdx, isUntermi
       const nx = buf[p + 1];
       if (nx === 0x6e) { p += 2; line++; rowEnded = true; break; }
       if (nx === 0x72) {
-        if (p + 3 < len && buf[p + 2] === 0x5c && buf[p + 3] === 0x6e) {
-          p += 4; line++; rowEnded = true; break;
-        }
-        outState.errCodes.push(ERR_CODE_STRAY_CR);
-        outState.errLines.push(recordLine);
-        outState.errRows.push(recordRowIdx);
-        outState.errExtraA.push(0);
-        outState.errExtraB.push(0);
+        if (p + 3 < len && buf[p + 2] === 0x5c && buf[p + 3] === 0x6e) { p += 4; line++; rowEnded = true; break; }
+        gErrCodes.push(0); gErrLines.push(recordLine); gErrRows.push(recordRowIdx); gErrExtraA.push(0); gErrExtraB.push(0);
         p += 2;
         continue;
       }
@@ -374,421 +364,300 @@ function readTailIntoOut(buf, len, outState, recordLine, recordRowIdx, isUntermi
   }
   if (p >= len) return -1;
   out[outPos++] = 0x22;
-  if (!isUnterminated && added > 0) {
-    outState.errCodes.push(ERR_CODE_QUOTE_JUNK);
-    outState.errLines.push(recordLine);
-    outState.errRows.push(recordRowIdx);
-    outState.errExtraA.push(0);
-    outState.errExtraB.push(0);
+  if (!isUnterm && added > 0) {
+    gErrCodes.push(2); gErrLines.push(recordLine); gErrRows.push(recordRowIdx); gErrExtraA.push(0); gErrExtraB.push(0);
   }
-  outState.p = p;
-  outState.pos = outPos;
-  outState.line = line;
-  outState.rowEnded = rowEnded;
-  outState.textClosed = textClosed;
+  gP = p;
+  gOutPos = outPos;
+  gLine = line;
+  gRowEnded = rowEnded;
+  gTextClosed = textClosed;
   return 0;
 }
 
-/**
- * Compact single-pass CSV parser directly from JSON-escaped UTF-8 bytes `buf[textStart..len)`.
- * Returns `textEnd` (index of closing `"`) on success, or `-1` on `\uXXXX`/malformed JSON.
- */
-function parseJsonTextSinglePass(buf, textStart, outState) {
-  const len = buf.length;
-  let p = textStart;
-  if (p + 3 <= len && buf[p] === 0xef && buf[p + 1] === 0xbb && buf[p + 2] === 0xbf) {
-    p += 3;
-  }
-
-  let out = outState.buf;
-  let safeLimit = out.length - 8192;
-  const savedOutPos = outState.pos;
-  let outPos = savedOutPos + 24;
-  if (outPos >= safeLimit) {
-    outState.pos = savedOutPos;
-    out = ensureOutBuf(outState, 65536);
-    safeLimit = out.length - 8192;
-  }
-
-  let extraBuf = outState.extraBuf;
-  let extraBufPos = 0;
-
-  const errCodes = [];
-  const errLines = [];
-  const errRows = [];
-  const errExtraA = [];
-  const errExtraB = [];
-  outState.errCodes = errCodes;
-  outState.errLines = errLines;
-  outState.errRows = errRows;
-  outState.errExtraA = errExtraA;
-  outState.errExtraB = errExtraB;
-
-  let width = -1;
-  let rowCount = 0;
-  let row0End = -1;
-  let line = 1;
-  let textClosed = false;
-
+function parseQuotedField(buf, p, len, out, outPos, recordLine, recordRowIdx, fieldOutStart) {
+  const openP = p;
+  const openLine = gLine;
+  let line = openLine;
+  p += 2;
+  let closed = false;
   while (p < len) {
-    while (p < len) {
-      const b = buf[p];
-      if (b === 0x5c) {
-        if (p + 1 >= len) { outState.pos = savedOutPos; return -1; }
-        const nx = buf[p + 1];
-        if (nx === 0x6e) { p += 2; line++; continue; }
-        if (nx === 0x72 && p + 3 < len && buf[p + 2] === 0x5c && buf[p + 3] === 0x6e) { p += 4; line++; continue; }
-        if (nx === 0x75) { outState.pos = savedOutPos; return -1; }
-      }
-      break;
-    }
-    if (p >= len) { outState.pos = savedOutPos; return -1; }
-    if (buf[p] === 0x22) { textClosed = true; break; }
-
-    if (outPos >= safeLimit) {
-      outState.pos = outPos;
-      out = ensureOutBuf(outState, 65536);
-      safeLimit = out.length - 8192;
-    }
-
-    const recordLine = line;
-    const recordRowIdx = rowCount;
-    const rowOutStart = outPos;
-
-    if (rowCount > 0) out[outPos++] = 0x2c;
-    out[outPos++] = 0x5b;
-
-    let fieldCount = 0;
-    const limitW = width < 0 ? 0x7fffffff : width;
-    let firstQuoted = false;
-    let firstFieldEmpty = false;
-    const extraRowStart = extraBufPos;
-    let rowEnded = false;
-
-    while (!rowEnded) {
-      if (p >= len) { outState.pos = savedOutPos; return -1; }
-      if (outPos >= safeLimit) {
-        outState.pos = outPos;
-        out = ensureOutBuf(outState, 65536);
-        safeLimit = out.length - 8192;
-      }
-
-      const inExtra = fieldCount >= limitW;
-      const isQuoted = (buf[p] === 0x5c && p + 1 < len && buf[p + 1] === 0x22);
-      if (fieldCount === 0) firstQuoted = isQuoted;
-      if (!inExtra && fieldCount > 0) out[outPos++] = 0x2c;
-
-      const fieldOutStart = outPos;
-      out[outPos++] = 0x22;
-
-      if (isQuoted) {
-        const openP = p;
-        const openLine = line;
-        p += 2;
-        let closed = false;
-        let nextChk = p + 4096;
-
-        while (p < len) {
-          if (p >= nextChk) {
-            if (outPos >= safeLimit) {
-              outState.pos = outPos;
-              out = ensureOutBuf(outState, 65536);
-              safeLimit = out.length - 8192;
-            }
-            nextChk = p + 4096;
-          }
-          const b = buf[p];
-          if (b === 0x5c) {
-            if (p + 1 >= len) { outState.pos = savedOutPos; return -1; }
-            const nx = buf[p + 1];
-            if (nx === 0x22) {
-              if (p + 3 < len && buf[p + 2] === 0x5c && buf[p + 3] === 0x22) {
-                out[outPos++] = 0x5c;
-                out[outPos++] = 0x22;
-                p += 4;
-                continue;
-              }
-              p += 2;
-              closed = true;
-              break;
-            }
-            if (nx === 0x72) {
-              out[outPos++] = 0x5c;
-              out[outPos++] = 0x6e;
-              line++;
-              p += (p + 3 < len && buf[p + 2] === 0x5c && buf[p + 3] === 0x6e) ? 4 : 2;
-              continue;
-            }
-            if (nx === 0x6e) {
-              out[outPos++] = 0x5c;
-              out[outPos++] = 0x6e;
-              line++;
-              p += 2;
-              continue;
-            }
-            if (nx === 0x75) { outState.pos = savedOutPos; return -1; }
-            if (nx === 0x2f) { out[outPos++] = 0x2f; p += 2; continue; }
-            out[outPos++] = 0x5c;
-            out[outPos++] = nx;
-            p += 2;
-            continue;
-          }
-          if (b === 0x22) break;
-          out[outPos++] = b;
-          p++;
-        }
-
-        if (!closed) {
-          p = openP + 2;
-          line = openLine;
-          outPos = fieldOutStart;
-          errCodes.push(ERR_CODE_UNTERM);
-          errLines.push(recordLine);
-          errRows.push(recordRowIdx);
-          errExtraA.push(0);
-          errExtraB.push(0);
-          out[outPos++] = 0x22;
+    const b = buf[p];
+    if (b === 0x5c) {
+      if (p + 1 >= len) return -1;
+      const nx = buf[p + 1];
+      if (nx === 0x22) {
+        if (p + 3 < len && buf[p + 2] === 0x5c && buf[p + 3] === 0x22) {
           out[outPos++] = 0x5c;
           out[outPos++] = 0x22;
-          outState.p = p;
-          outState.pos = outPos;
-          outState.line = line;
-          if (readTailIntoOut(buf, len, outState, recordLine, recordRowIdx, true) === -1) {
-            outState.pos = savedOutPos;
-            return -1;
-          }
-          p = outState.p;
-          outPos = outState.pos;
-          out = outState.buf;
-          safeLimit = out.length - 8192;
-          line = outState.line;
-          rowEnded = outState.rowEnded;
-          textClosed = outState.textClosed;
-        } else {
-          if (p >= len) { outState.pos = savedOutPos; return -1; }
-          const nb = buf[p];
-          if (nb === 0x2c) {
-            p++;
-            out[outPos++] = 0x22;
-          } else if (nb === 0x22) {
-            textClosed = true;
-            rowEnded = true;
-            out[outPos++] = 0x22;
-          } else if (nb === 0x5c && p + 1 < len && buf[p + 1] === 0x6e) {
-            p += 2;
-            line++;
-            rowEnded = true;
-            out[outPos++] = 0x22;
-          } else if (nb === 0x5c && p + 3 < len && buf[p + 1] === 0x72 && buf[p + 2] === 0x5c && buf[p + 3] === 0x6e) {
-            p += 4;
-            line++;
-            rowEnded = true;
-            out[outPos++] = 0x22;
-          } else {
-            outState.p = p;
-            outState.pos = outPos;
-            outState.line = line;
-            if (readTailIntoOut(buf, len, outState, recordLine, recordRowIdx, false) === -1) {
-              outState.pos = savedOutPos;
-              return -1;
-            }
-            p = outState.p;
-            outPos = outState.pos;
-            out = outState.buf;
-            safeLimit = out.length - 8192;
-            line = outState.line;
-            rowEnded = outState.rowEnded;
-            textClosed = outState.textClosed;
-          }
+          p += 4;
+          continue;
         }
-      } else {
-        let nextChk = p + 4096;
-        while (true) {
-          if (p >= nextChk) {
-            if (outPos >= safeLimit) {
-              outState.pos = outPos;
-              out = ensureOutBuf(outState, 65536);
-              safeLimit = out.length - 8192;
-            }
-            nextChk = p + 4096;
+        p += 2;
+        closed = true;
+        break;
+      }
+      if (nx === 0x72) {
+        out[outPos++] = 0x5c;
+        out[outPos++] = 0x6e;
+        line++;
+        p += (p + 3 < len && buf[p + 2] === 0x5c && buf[p + 3] === 0x6e) ? 4 : 2;
+        continue;
+      }
+      if (nx === 0x6e) {
+        out[outPos++] = 0x5c;
+        out[outPos++] = 0x6e;
+        line++;
+        p += 2;
+        continue;
+      }
+      if (nx === 0x75) return -1;
+      if (nx === 0x2f) { out[outPos++] = 0x2f; p += 2; continue; }
+      out[outPos++] = 0x5c;
+      out[outPos++] = nx;
+      p += 2;
+      continue;
+    }
+    if (b === 0x22) break;
+    out[outPos++] = b;
+    p++;
+  }
+  if (!closed) {
+    p = openP + 2;
+    line = openLine;
+    outPos = fieldOutStart;
+    gErrCodes.push(1); gErrLines.push(recordLine); gErrRows.push(recordRowIdx); gErrExtraA.push(0); gErrExtraB.push(0);
+    out[outPos++] = 0x22;
+    out[outPos++] = 0x5c;
+    out[outPos++] = 0x22;
+    gLine = line;
+    return handleTail(buf, p, len, out, outPos, recordLine, recordRowIdx, true);
+  }
+  if (p >= len) return -1;
+  const nb = buf[p];
+  if (nb === 0x2c) { gP = p + 1; out[outPos++] = 0x22; gOutPos = outPos; gLine = line; gRowEnded = false; return 0; }
+  if (nb === 0x22) { gP = p; out[outPos++] = 0x22; gOutPos = outPos; gLine = line; gRowEnded = true; gTextClosed = true; return 0; }
+  if (nb === 0x5c && p + 1 < len && buf[p + 1] === 0x6e) { gP = p + 2; out[outPos++] = 0x22; gOutPos = outPos; gLine = line + 1; gRowEnded = true; return 0; }
+  if (nb === 0x5c && p + 3 < len && buf[p + 1] === 0x72 && buf[p + 2] === 0x5c && buf[p + 3] === 0x6e) { gP = p + 4; out[outPos++] = 0x22; gOutPos = outPos; gLine = line + 1; gRowEnded = true; return 0; }
+  gLine = line;
+  return handleTail(buf, p, len, out, outPos, recordLine, recordRowIdx, false);
+}
+
+function parseRow(buf, len) {
+  let out = gOut;
+  let extraBuf = gExtraBuf;
+  let p = gP;
+  let outPos = gOutPos;
+  let line = gLine;
+  const width = gWidth;
+  const limitW = width < 0 ? 0x7fffffff : width;
+  const recordLine = line;
+  const recordRowIdx = gRowCount;
+  const rowOutStart = outPos;
+  if (recordRowIdx > 0) out[outPos++] = 0x2c;
+  out[outPos++] = 0x5b;
+
+  let fieldCount = 0;
+  let firstQuoted = false;
+  let firstFieldEmpty = false;
+  const extraRowStart = gExtraBufPos;
+  let rowEnded = false;
+
+  while (!rowEnded) {
+    if (p >= len) return -1;
+    const inExtra = fieldCount >= limitW;
+    const isQuoted = (buf[p] === 0x5c && p + 1 < len && buf[p + 1] === 0x22);
+    if (fieldCount === 0) firstQuoted = isQuoted;
+    if (!inExtra && fieldCount > 0) out[outPos++] = 0x2c;
+    let fieldOutStart = outPos;
+    out[outPos++] = 0x22;
+
+    if (isQuoted) {
+      gLine = line;
+      if (parseQuotedField(buf, p, len, out, outPos, recordLine, recordRowIdx, fieldOutStart) === -1) return -1;
+      p = gP; outPos = gOutPos; line = gLine; rowEnded = gRowEnded;
+    } else {
+      while (true) {
+        if (p >= len) return -1;
+        const b = buf[p];
+        if (b === 0x2c) {
+          p++;
+          if (fieldCount + 1 < limitW && !(buf[p] === 0x5c && p + 1 < len && buf[p + 1] === 0x22)) {
+            out[outPos] = 0x22;
+            out[outPos + 1] = 0x2c;
+            out[outPos + 2] = 0x22;
+            outPos += 3;
+            fieldCount++;
+            fieldOutStart = outPos - 1;
+            continue;
           }
-          if (p >= len) { outState.pos = savedOutPos; return -1; }
-          const b = buf[p];
-          if (b === 0x2c) { p++; break; }
-          if (b === 0x5c) {
-            if (p + 1 >= len) { outState.pos = savedOutPos; return -1; }
-            const nx = buf[p + 1];
-            if (nx === 0x6e) { p += 2; line++; rowEnded = true; break; }
-            if (nx === 0x72) {
-              if (p + 3 < len && buf[p + 2] === 0x5c && buf[p + 3] === 0x6e) {
-                p += 4; line++; rowEnded = true; break;
-              }
-              errCodes.push(ERR_CODE_STRAY_CR);
-              errLines.push(recordLine);
-              errRows.push(recordRowIdx);
-              errExtraA.push(0);
-              errExtraB.push(0);
-              p += 2;
-              continue;
-            }
-            if (nx === 0x75) { outState.pos = savedOutPos; return -1; }
-            if (nx === 0x2f) { out[outPos++] = 0x2f; p += 2; continue; }
-            out[outPos++] = 0x5c;
-            out[outPos++] = nx;
+          break;
+        }
+        if (b === 0x5c) {
+          if (p + 1 >= len) return -1;
+          const nx = buf[p + 1];
+          if (nx === 0x6e) { p += 2; line++; rowEnded = true; break; }
+          if (nx === 0x72) {
+            if (p + 3 < len && buf[p + 2] === 0x5c && buf[p + 3] === 0x6e) { p += 4; line++; rowEnded = true; break; }
+            gErrCodes.push(0); gErrLines.push(recordLine); gErrRows.push(recordRowIdx); gErrExtraA.push(0); gErrExtraB.push(0);
             p += 2;
             continue;
           }
-          if (b === 0x22) { textClosed = true; rowEnded = true; break; }
-          out[outPos++] = b;
-          p++;
+          if (nx === 0x75) return -1;
+          if (nx === 0x2f) { out[outPos++] = 0x2f; p += 2; continue; }
+          out[outPos++] = 0x5c;
+          out[outPos++] = nx;
+          p += 2;
+          continue;
         }
-        if (fieldCount === 0 && !inExtra) firstFieldEmpty = (outPos === fieldOutStart + 1);
-        out[outPos++] = 0x22;
+        if (b === 0x22) { gTextClosed = true; rowEnded = true; break; }
+        out[outPos++] = b;
+        p++;
       }
-
-      if (inExtra) {
-        const fJsonLen = outPos - fieldOutStart;
-        const needComma = extraBufPos > extraRowStart ? 1 : 0;
-        if (extraBufPos + fJsonLen + needComma + 16 > extraBuf.length) {
-          const next = Buffer.allocUnsafe(Math.max(extraBuf.length * 2, extraBufPos + fJsonLen + 4096));
-          extraBuf.copy(next, 0, 0, extraBufPos);
-          extraBuf = next;
-          outState.extraBuf = extraBuf;
-        }
-        if (needComma) extraBuf[extraBufPos++] = 0x2c;
-        out.copy(extraBuf, extraBufPos, fieldOutStart, outPos);
-        extraBufPos += fJsonLen;
-        outPos = fieldOutStart;
-      }
-      fieldCount++;
+      if (fieldCount === 0 && !inExtra) firstFieldEmpty = (outPos === fieldOutStart + 1);
+      out[outPos++] = 0x22;
     }
 
-    if (fieldCount === 1 && firstFieldEmpty && !firstQuoted) {
-      outPos = rowOutStart;
-      if (textClosed) break;
-      continue;
+    if (inExtra) {
+      const fJsonLen = outPos - fieldOutStart;
+      let ep = gExtraBufPos;
+      if (ep + fJsonLen + 16 > extraBuf.length) extraBuf = growExtra(ep + fJsonLen + 16);
+      if (ep > extraRowStart) extraBuf[ep++] = 0x2c;
+      for (let i = 0; i < fJsonLen; i++) extraBuf[ep++] = out[fieldOutStart + i];
+      gExtraBufPos = ep;
+      outPos = fieldOutStart;
     }
-
-    if (width < 0) width = fieldCount;
-
-    if (fieldCount < width) {
-      errCodes.push(ERR_CODE_SHORT);
-      errLines.push(recordLine);
-      errRows.push(recordRowIdx);
-      errExtraA.push(fieldCount);
-      errExtraB.push(0);
-      const padCount = width - fieldCount;
-      if (outPos + padCount * 3 + 16 > out.length) {
-        outState.pos = outPos;
-        out = ensureOutBuf(outState, padCount * 3 + 64);
-        safeLimit = out.length - 8192;
-      }
-      for (let k = 0; k < padCount; k++) {
-        out[outPos++] = 0x2c;
-        out[outPos++] = 0x22;
-        out[outPos++] = 0x22;
-      }
-    } else if (fieldCount > width) {
-      errCodes.push(ERR_CODE_LONG);
-      errLines.push(recordLine);
-      errRows.push(recordRowIdx);
-      errExtraA.push(extraRowStart);
-      errExtraB.push(extraBufPos - extraRowStart);
-    }
-
-    out[outPos++] = 0x5d;
-    if (rowCount === 0) row0End = outPos;
-    rowCount++;
-    if (textClosed) break;
+    fieldCount++;
   }
 
-  outState.pos = outPos;
-  outState.savedOutPos = savedOutPos;
-  outState.rowCount = rowCount;
-  outState.row0End = row0End;
-  return p;
+  gP = p;
+  gLine = line;
+  if (fieldCount === 1 && firstFieldEmpty && !firstQuoted) {
+    gOutPos = rowOutStart;
+    return 0;
+  }
+
+  if (width < 0) gWidth = fieldCount;
+  else if (fieldCount < width) {
+    gErrCodes.push(3); gErrLines.push(recordLine); gErrRows.push(recordRowIdx); gErrExtraA.push(fieldCount); gErrExtraB.push(0);
+    const padCount = width - fieldCount;
+    gOutPos = outPos;
+    out = ensureOut(padCount * 3 + (len - p) * 3 + 65536);
+    for (let k = 0; k < padCount; k++) {
+      out[outPos++] = 0x2c;
+      out[outPos++] = 0x22;
+      out[outPos++] = 0x22;
+    }
+  } else if (fieldCount > width) {
+    gErrCodes.push(4); gErrLines.push(recordLine); gErrRows.push(recordRowIdx); gErrExtraA.push(extraRowStart); gErrExtraB.push(gExtraBufPos - extraRowStart);
+  }
+
+  out[outPos++] = 0x5d;
+  if (recordRowIdx === 0) gRow0End = outPos;
+  gRowCount = recordRowIdx + 1;
+  gOutPos = outPos;
+  return 0;
 }
 
-function finalizeCaseOutput(header, outState) {
-  let out = outState.buf;
-  let outPos = outState.pos;
-  const savedOutPos = outState.savedOutPos;
-  const rowCount = outState.rowCount;
-  const row0End = outState.row0End;
-  const errCodes = outState.errCodes;
-  const errLines = outState.errLines;
-  const errRows = outState.errRows;
-  const errExtraA = outState.errExtraA;
-  const errExtraB = outState.errExtraB;
-  const extraBuf = outState.extraBuf;
+function parseTextCase(buf, textStart, len, savedOutPos) {
+  let p = textStart;
+  if (p + 3 <= len && buf[p] === 0xef && buf[p + 1] === 0xbb && buf[p + 2] === 0xbf) p += 3;
+  gP = p;
+  gOutPos = savedOutPos + 24;
+  gExtraBufPos = 0;
+  gErrCodes.length = 0;
+  gErrLines.length = 0;
+  gErrRows.length = 0;
+  gErrExtraA.length = 0;
+  gErrExtraB.length = 0;
+  gWidth = -1;
+  gRowCount = 0;
+  gRow0End = -1;
+  gLine = 1;
+  gTextClosed = false;
+
+  while (gP < len) {
+    p = gP;
+    while (p < len && buf[p] === 0x5c) {
+      if (p + 1 >= len) return -1;
+      const nx = buf[p + 1];
+      if (nx === 0x6e) { p += 2; gLine++; continue; }
+      if (nx === 0x72 && p + 3 < len && buf[p + 2] === 0x5c && buf[p + 3] === 0x6e) { p += 4; gLine++; continue; }
+      if (nx === 0x75) return -1;
+      break;
+    }
+    if (p >= len) return -1;
+    gP = p;
+    if (buf[p] === 0x22) { gTextClosed = true; break; }
+    if (parseRow(buf, len) === -1) return -1;
+    if (gTextClosed) break;
+  }
+  return gP;
+}
+
+function finalizeCase(header, savedOutPos, remainingInputBytes) {
+  let outPos = gOutPos;
+  const rowCount = gRowCount;
+  const row0End = gRow0End;
+  let out = ensureOut(remainingInputBytes * 3 + 65536);
 
   if (rowCount === 0) {
     outPos = savedOutPos;
     const pref = header ? B_EMPTY_HDR_TRUE : B_PREFIX_HDR_FALSE;
-    outState.pos = outPos;
-    out = ensureOutBuf(outState, pref.length + B_ERR_MID.length + 16);
-    pref.copy(out, outPos);
+    out.set(pref, outPos);
     outPos += pref.length;
     if (!header) {
-      B_ERR_MID.copy(out, outPos);
+      out.set(B_ERR_MID, outPos);
       outPos += B_ERR_MID.length;
     }
   } else if (!header) {
-    B_PREFIX_HDR_FALSE.copy(out, savedOutPos);
-    outState.pos = outPos;
-    out = ensureOutBuf(outState, B_ERR_MID.length + 16);
-    B_ERR_MID.copy(out, outPos);
+    out.set(B_PREFIX_HDR_FALSE, savedOutPos);
+    out.set(B_ERR_MID, outPos);
     outPos += B_ERR_MID.length;
   } else {
     const row0Start = savedOutPos + 24;
     const row0Len = row0End - row0Start;
-    B_PREFIX_HDR_TRUE.copy(out, savedOutPos);
+    out.set(B_PREFIX_HDR_TRUE, savedOutPos);
     out.copyWithin(savedOutPos + 11, row0Start, row0End);
     const midPos = savedOutPos + 11 + row0Len;
-    B_ROWS_MID.copy(out, midPos);
+    out.set(B_ROWS_MID, midPos);
     if (rowCount === 1) {
       outPos = midPos + B_ROWS_MID.length;
     } else {
       for (let k = midPos + B_ROWS_MID.length; k <= row0End; k++) out[k] = 0x20;
     }
-    outState.pos = outPos;
-    out = ensureOutBuf(outState, B_ERR_MID.length + 16);
-    B_ERR_MID.copy(out, outPos);
+    out.set(B_ERR_MID, outPos);
     outPos += B_ERR_MID.length;
   }
 
-  for (let i = 0; i < errCodes.length; i++) {
-    const code = errCodes[i];
-    const extraLen = code === ERR_CODE_LONG ? errExtraB[i] : 0;
-    outState.pos = outPos;
-    out = ensureOutBuf(outState, 128 + extraLen);
+  for (let i = 0; i < gErrCodes.length; i++) {
+    const code = gErrCodes[i];
+    const extraLen = code === 4 ? gErrExtraB[i] : 0;
+    gOutPos = outPos;
+    out = ensureOut(128 + extraLen + remainingInputBytes * 3 + 65536);
     if (i > 0) out[outPos++] = 0x2c;
     const pref = ERR_PREFIXES[code];
-    pref.copy(out, outPos);
+    out.set(pref, outPos);
     outPos += pref.length;
-    outPos = writeAsciiInt(out, outPos, errLines[i]);
-    ERR_ROW_KEY.copy(out, outPos);
+    outPos = writeAsciiInt(out, outPos, gErrLines[i]);
+    out.set(ERR_ROW_KEY, outPos);
     outPos += ERR_ROW_KEY.length;
-    const rawRow = errRows[i];
-    if (header) {
-      if (rawRow === 0) {
-        ERR_NULL.copy(out, outPos);
-        outPos += ERR_NULL.length;
-      } else {
-        outPos = writeAsciiInt(out, outPos, rawRow - 1);
-      }
+    const rawRow = gErrRows[i];
+    if (header && rawRow === 0) {
+      out.set(ERR_NULL, outPos);
+      outPos += ERR_NULL.length;
     } else {
-      outPos = writeAsciiInt(out, outPos, rawRow);
+      outPos = writeAsciiInt(out, outPos, header ? rawRow - 1 : rawRow);
     }
-    if (code === ERR_CODE_SHORT) {
-      ERR_FIELDS_KEY.copy(out, outPos);
+    if (code === 3) {
+      out.set(ERR_FIELDS_KEY, outPos);
       outPos += ERR_FIELDS_KEY.length;
-      outPos = writeAsciiInt(out, outPos, errExtraA[i]);
-    } else if (code === ERR_CODE_LONG) {
-      ERR_EXTRA_KEY.copy(out, outPos);
+      outPos = writeAsciiInt(out, outPos, gErrExtraA[i]);
+    } else if (code === 4) {
+      out.set(ERR_EXTRA_KEY, outPos);
       outPos += ERR_EXTRA_KEY.length;
       if (extraLen > 0) {
-        extraBuf.copy(out, outPos, errExtraA[i], errExtraA[i] + extraLen);
+        out.set(gExtraBuf.subarray(gErrExtraA[i], gErrExtraA[i] + extraLen), outPos);
         outPos += extraLen;
       }
       out[outPos++] = 0x5d;
@@ -796,10 +665,8 @@ function finalizeCaseOutput(header, outState) {
     out[outPos++] = 0x7d;
   }
 
-  outState.pos = outPos;
-  out = ensureOutBuf(outState, B_END_OBJ.length);
-  B_END_OBJ.copy(out, outPos);
-  outState.pos = outPos + B_END_OBJ.length;
+  out.set(B_END_OBJ, outPos);
+  gOutPos = outPos + B_END_OBJ.length;
 }
 
 /**
@@ -809,126 +676,109 @@ function finalizeCaseOutput(header, outState) {
  */
 export function runCasesBuffer(casesBuf) {
   const len = casesBuf.length;
-  let p = skipWs(casesBuf, 0, len);
-  if (p >= len || casesBuf[p] !== 0x5b) {
+  const buf = new Uint8Array(casesBuf.buffer, casesBuf.byteOffset, len);
+  let p = skipWs(buf, 0, len);
+  if (p >= len || buf[p] !== 0x5b) {
     const cases = JSON.parse(casesBuf.toString('utf8'));
     return Buffer.from(JSON.stringify(cases.map((c) => run(c.input))));
   }
   p++;
 
-  const outState = {
-    buf: Buffer.allocUnsafe(Math.max(131072, Math.ceil(len * 1.25))),
-    pos: 1,
-    extraBuf: Buffer.allocUnsafe(16384),
-    savedOutPos: 0,
-    rowCount: 0,
-    row0End: -1,
-    p: 0,
-    line: 1,
-    rowEnded: false,
-    textClosed: false,
-    errCodes: null,
-    errLines: null,
-    errRows: null,
-    errExtraA: null,
-    errExtraB: null,
-  };
-  outState.buf[0] = 0x5b;
-
-  function appendOutBytes(b) {
-    const out = ensureOutBuf(outState, b.length);
-    b.copy(out, outState.pos);
-    outState.pos += b.length;
-  }
+  const outRaw = Buffer.allocUnsafe(Math.max(262144, len * 3 + 1048576));
+  gOut = new Uint8Array(outRaw.buffer, outRaw.byteOffset, outRaw.byteLength);
+  const extraRaw = Buffer.allocUnsafe(65536);
+  gExtraBuf = new Uint8Array(extraRaw.buffer, extraRaw.byteOffset, extraRaw.byteLength);
+  gOutPos = 0;
+  gOut[gOutPos++] = 0x5b;
 
   let caseIdx = 0;
-  p = skipWs(casesBuf, p, len);
-  if (p < len && casesBuf[p] !== 0x5d) {
+  p = skipWs(buf, p, len);
+  if (p < len && buf[p] !== 0x5d) {
     while (p < len) {
-      p = skipWs(casesBuf, p, len);
+      p = skipWs(buf, p, len);
       const caseStart = p;
-      if (casesBuf[p] !== 0x7b) {
+      if (buf[p] !== 0x7b) {
         const cases = JSON.parse(casesBuf.toString('utf8'));
+        gOut = null; gExtraBuf = null;
         return Buffer.from(JSON.stringify(cases.map((c) => run(c.input))));
       }
       p++;
 
-      if (caseIdx > 0) {
-        const out = ensureOutBuf(outState, 1);
-        out[outState.pos++] = 0x2c;
-      }
+      ensureOut((len - p) * 3 + 65536);
+      if (caseIdx > 0) gOut[gOutPos++] = 0x2c;
       caseIdx++;
 
+      const savedOutPos = gOutPos;
       let headerVal = undefined;
       let textParsed = false;
       let malformed = false;
       let needFallback = false;
 
       while (p < len) {
-        p = skipWs(casesBuf, p, len);
-        if (casesBuf[p] === 0x7d) { p++; break; }
-        if (casesBuf[p] === 0x2c) { p++; p = skipWs(casesBuf, p, len); }
-        if (casesBuf[p] !== 0x22) { malformed = true; break; }
-        const kEnd = findJsonStringEnd(casesBuf, p + 1, len);
+        p = skipWs(buf, p, len);
+        if (buf[p] === 0x7d) { p++; break; }
+        if (buf[p] === 0x2c) { p++; p = skipWs(buf, p, len); }
+        if (buf[p] !== 0x22) { malformed = true; break; }
+        const kEnd = findJsonStringEnd(buf, p + 1, len);
         if (kEnd === -1) { malformed = true; break; }
         const isInputKey = (kEnd - (p + 1) === 5 &&
-          casesBuf[p + 1] === 0x69 && casesBuf[p + 2] === 0x6e &&
-          casesBuf[p + 3] === 0x70 && casesBuf[p + 4] === 0x75 && casesBuf[p + 5] === 0x74);
-        p = skipWs(casesBuf, kEnd + 1, len);
-        if (casesBuf[p] !== 0x3a) { malformed = true; break; }
-        p = skipWs(casesBuf, p + 1, len);
+          buf[p + 1] === 0x69 && buf[p + 2] === 0x6e &&
+          buf[p + 3] === 0x70 && buf[p + 4] === 0x75 && buf[p + 5] === 0x74);
+        p = skipWs(buf, kEnd + 1, len);
+        if (buf[p] !== 0x3a) { malformed = true; break; }
+        p = skipWs(buf, p + 1, len);
 
         if (!isInputKey) {
-          p = skipJsonValue(casesBuf, p, len);
+          p = skipJsonValue(buf, p, len);
           if (p === -1) { malformed = true; break; }
           continue;
         }
-        if (casesBuf[p] !== 0x7b) { malformed = true; break; }
+        if (buf[p] !== 0x7b) { malformed = true; break; }
         p++;
         while (p < len) {
-          p = skipWs(casesBuf, p, len);
-          if (casesBuf[p] === 0x7d) { p++; break; }
-          if (casesBuf[p] === 0x2c) { p++; p = skipWs(casesBuf, p, len); }
-          if (casesBuf[p] !== 0x22) { malformed = true; break; }
-          const ikEnd = findJsonStringEnd(casesBuf, p + 1, len);
+          p = skipWs(buf, p, len);
+          if (buf[p] === 0x7d) { p++; break; }
+          if (buf[p] === 0x2c) { p++; p = skipWs(buf, p, len); }
+          if (buf[p] !== 0x22) { malformed = true; break; }
+          const ikEnd = findJsonStringEnd(buf, p + 1, len);
           if (ikEnd === -1) { malformed = true; break; }
           const ikLen = ikEnd - (p + 1);
           const isTextKey = (ikLen === 4 &&
-            casesBuf[p + 1] === 0x74 && casesBuf[p + 2] === 0x65 &&
-            casesBuf[p + 3] === 0x78 && casesBuf[p + 4] === 0x74);
+            buf[p + 1] === 0x74 && buf[p + 2] === 0x65 &&
+            buf[p + 3] === 0x78 && buf[p + 4] === 0x74);
           const isHeaderKey = (ikLen === 6 &&
-            casesBuf[p + 1] === 0x68 && casesBuf[p + 2] === 0x65 &&
-            casesBuf[p + 3] === 0x61 && casesBuf[p + 4] === 0x64 &&
-            casesBuf[p + 5] === 0x65 && casesBuf[p + 6] === 0x72);
-          p = skipWs(casesBuf, ikEnd + 1, len);
-          if (casesBuf[p] !== 0x3a) { malformed = true; break; }
-          p = skipWs(casesBuf, p + 1, len);
-          if (isTextKey && casesBuf[p] === 0x22 && !textParsed) {
-            const endQuote = parseJsonTextSinglePass(casesBuf, p + 1, outState);
-            if (endQuote === -1) {
-              const qEnd = findJsonStringEnd(casesBuf, p + 1, len);
+            buf[p + 1] === 0x68 && buf[p + 2] === 0x65 &&
+            buf[p + 3] === 0x61 && buf[p + 4] === 0x64 &&
+            buf[p + 5] === 0x65 && buf[p + 6] === 0x72);
+          p = skipWs(buf, ikEnd + 1, len);
+          if (buf[p] !== 0x3a) { malformed = true; break; }
+          p = skipWs(buf, p + 1, len);
+          if (isTextKey && buf[p] === 0x22 && !textParsed && !needFallback) {
+            const endQ = parseTextCase(buf, p + 1, len, savedOutPos);
+            if (endQ === -1) {
+              const qEnd = findJsonStringEnd(buf, p + 1, len);
               if (qEnd === -1) { malformed = true; break; }
               p = qEnd + 1;
               needFallback = true;
             } else {
-              p = endQuote + 1;
+              p = endQ + 1;
               textParsed = true;
             }
           } else if (isHeaderKey) {
-            if (p + 4 <= len && casesBuf[p] === 0x74 && casesBuf[p + 1] === 0x72 && casesBuf[p + 2] === 0x75 && casesBuf[p + 3] === 0x65) {
+            if (p + 4 <= len && buf[p] === 0x74 && buf[p + 1] === 0x72 && buf[p + 2] === 0x75 && buf[p + 3] === 0x65) {
               headerVal = true;
               p += 4;
-            } else if (p + 5 <= len && casesBuf[p] === 0x66 && casesBuf[p + 1] === 0x61 && casesBuf[p + 2] === 0x6c && casesBuf[p + 3] === 0x73 && casesBuf[p + 4] === 0x65) {
+            } else if (p + 5 <= len && buf[p] === 0x66 && buf[p + 1] === 0x61 && buf[p + 2] === 0x6c && buf[p + 3] === 0x73 && buf[p + 4] === 0x65) {
               headerVal = false;
               p += 5;
             } else {
-              p = skipJsonValue(casesBuf, p, len);
+              p = skipJsonValue(buf, p, len);
               if (p === -1) { malformed = true; break; }
               headerVal = null;
               needFallback = true;
             }
           } else {
-            p = skipJsonValue(casesBuf, p, len);
+            p = skipJsonValue(buf, p, len);
             if (p === -1) { malformed = true; break; }
           }
         }
@@ -937,32 +787,50 @@ export function runCasesBuffer(casesBuf) {
 
       if (malformed) {
         const cases = JSON.parse(casesBuf.toString('utf8'));
+        gOut = null; gExtraBuf = null;
         return Buffer.from(JSON.stringify(cases.map((c) => run(c.input))));
       }
       const caseEnd = p;
 
       if (textParsed && !needFallback && (headerVal === true || headerVal === false)) {
-        finalizeCaseOutput(headerVal, outState);
+        finalizeCase(headerVal, savedOutPos, len - p);
       } else {
-        if (textParsed) outState.pos = outState.savedOutPos;
+        gOutPos = savedOutPos;
         const parsed = JSON.parse(casesBuf.subarray(caseStart, caseEnd).toString('utf8'));
-        appendOutBytes(Buffer.from(JSON.stringify(run(parsed.input))));
+        const fb = Buffer.from(JSON.stringify(run(parsed.input)));
+        const out = ensureOut(fb.length + (len - p) * 3 + 65536);
+        out.set(fb, gOutPos);
+        gOutPos += fb.length;
       }
 
-      p = skipWs(casesBuf, p, len);
-      if (p < len && casesBuf[p] === 0x2c) {
-        p++;
-        continue;
-      }
-      if (p < len && casesBuf[p] === 0x5d) {
-        p++;
-        break;
-      }
+      p = skipWs(buf, p, len);
+      if (p < len && buf[p] === 0x2c) { p++; continue; }
+      if (p < len && buf[p] === 0x5d) { p++; break; }
       const cases = JSON.parse(casesBuf.toString('utf8'));
+      gOut = null; gExtraBuf = null;
       return Buffer.from(JSON.stringify(cases.map((c) => run(c.input))));
     }
   }
 
-  appendOutBytes(Buffer.from(']'));
-  return outState.buf.subarray(0, outState.pos);
+  ensureOut(16);
+  gOut[gOutPos++] = 0x5d;
+  const finalLen = gOutPos;
+  const result = Buffer.from(gOut.buffer, gOut.byteOffset, finalLen);
+  gOut = null;
+  gExtraBuf = null;
+  return result;
+}
+
+// Pre-warm V8 JIT type feedback on tiny synthetic data (no case data retained).
+{
+  const r1 = 'a,b,c\n';
+  const r2 = '"q1,q2""q3\r\n\n/\t",plain/x\t,"q"junk,x\ry\r\n';
+  const r3 = '\n1\n1,2,3,4,5\n';
+  const body = (r1 + r2 + r3).repeat(12);
+  const wb = Buffer.from(JSON.stringify([
+    { id: 'w1', input: { text: '\uFEFF' + body + '"unterm\r\n', header: true } },
+    { id: 'w2', input: { text: body + 'x,y', header: false } },
+    { id: 'w3', input: { text: '', header: true } },
+  ]).replaceAll('/', '\\/'));
+  for (let i = 0; i < 6; i++) runCasesBuffer(wb);
 }
