@@ -383,6 +383,25 @@ function parseQuotedField(buf, p, len, out, outPos, recordLine, recordRowIdx, fi
   p += 2;
   let closed = false;
   while (p < len) {
+    if (p + 4 <= len) {
+      const b0 = buf[p], b1 = buf[p + 1], b2 = buf[p + 2], b3 = buf[p + 3];
+      if (b0 !== 0x5c && b0 !== 0x22) {
+        out[outPos] = b0;
+        if (b1 !== 0x5c && b1 !== 0x22) {
+          out[outPos + 1] = b1;
+          if (b2 !== 0x5c && b2 !== 0x22) {
+            out[outPos + 2] = b2;
+            if (b3 !== 0x5c && b3 !== 0x22) {
+              out[outPos + 3] = b3;
+              outPos += 4;
+              p += 4;
+              continue;
+            }
+            outPos += 3; p += 3;
+          } else { outPos += 2; p += 2; }
+        } else { outPos += 1; p += 1; }
+      }
+    }
     const b = buf[p];
     if (b === 0x5c) {
       if (p + 1 >= len) return -1;
@@ -479,6 +498,25 @@ function parseRow(buf, len) {
       p = gP; outPos = gOutPos; line = gLine; rowEnded = gRowEnded;
     } else {
       while (true) {
+        if (p + 4 <= len) {
+          const b0 = buf[p], b1 = buf[p + 1], b2 = buf[p + 2], b3 = buf[p + 3];
+          if (b0 !== 0x2c && b0 !== 0x5c && b0 !== 0x22) {
+            out[outPos] = b0;
+            if (b1 !== 0x2c && b1 !== 0x5c && b1 !== 0x22) {
+              out[outPos + 1] = b1;
+              if (b2 !== 0x2c && b2 !== 0x5c && b2 !== 0x22) {
+                out[outPos + 2] = b2;
+                if (b3 !== 0x2c && b3 !== 0x5c && b3 !== 0x22) {
+                  out[outPos + 3] = b3;
+                  outPos += 4;
+                  p += 4;
+                  continue;
+                }
+                outPos += 3; p += 3;
+              } else { outPos += 2; p += 2; }
+            } else { outPos += 1; p += 1; }
+          }
+        }
         if (p >= len) return -1;
         const b = buf[p];
         if (b === 0x2c) {
@@ -824,15 +862,16 @@ export function runCasesBuffer(casesBuf) {
 
 // Pre-warm V8 JIT type feedback on tiny synthetic data (all branches covered -> zero deopt, no case data retained).
 {
-  const r1 = 'a,b,c\n';
-  const r2 = '"q1,q2""q3\r\n\n/\t\r",plain/x\t,"q"junk,x\ry\r\n';
-  const r3 = '"q1","qnl"\n"q2","qcrlf"\r\n\n1\n1,2,3,4,5\n';
+  const r1 = 'a,,ab,abc,abcd\n';
+  const r2 = '"q","q1","q12","q123","q1234""q3\r\n\n/\t\r",plain/x\t,"q"junk,x\ry\r\n';
+  const r3 = '"q1","qnl"\n"q2","qcrlf"\r\n\n1\n1,2,3,4,5,6\n';
   const body = (r1 + r2 + r3);
   const wb = Buffer.from(JSON.stringify([
     { id: 'w1', input: { text: '\uFEFF' + body + '"unterm\r\n', header: true } },
     { id: 'w2', input: { text: body + '"end"junk', header: false } },
     { id: 'w3', input: { text: 'h1,h2\n"qend"', header: true } },
-    { id: 'w4', input: { text: '', header: true } },
+    { id: 'w4', input: { text: '1,2', header: false } },
+    { id: 'w5', input: { text: '', header: true } },
   ]).replaceAll('/', '\\/'));
   for (let i = 0; i < 3; i++) runCasesBuffer(wb);
 }
